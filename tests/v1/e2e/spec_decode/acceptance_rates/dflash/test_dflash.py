@@ -7,6 +7,7 @@ import pytest
 
 from tests.evals.gsm8k.gsm8k_eval import evaluate_gsm8k_offline
 from tests.utils import single_gpu_only
+from vllm import SamplingParams
 from vllm.config import CompilationConfig
 
 from ...utils import compute_acceptance_len
@@ -159,3 +160,37 @@ def test_dflash_correctness(
             f"{context}: acceptance_len {acceptance_len:.3f} is below "
             f"{config.expected_acceptance_len:.3f}; accuracy={accuracy:.3f}"
         )
+
+
+@single_gpu_only
+def test_dflash_profiles_when_seqs_exceed_token_budget(vllm_runner):
+    """Startup must survive max_num_seqs * (1 + N) > max_num_batched_tokens.
+
+    Memory profiling hands the speculator max_num_seqs dummy requests, but its
+    per-request index buffers are only valid up to max_num_batched_tokens //
+    (1 + N). With the default H200 serving config (1024 seqs, 8192 tokens) any
+    DFlash-family drafter with N >= 8 indexed past the input buffer and failed
+    engine init with a device-side assert. 64 * 16 = 1024 > 512 reproduces it.
+    """
+    with vllm_runner(
+        QWEN3_DFLASH.model,
+        block_size=None,
+        trust_remote_code=True,
+        speculative_config={
+            "method": "dflash",
+            "model": QWEN3_DFLASH.draft_model,
+            "num_speculative_tokens": 15,
+        },
+        max_num_seqs=64,
+        max_num_batched_tokens=512,
+        max_model_len=512,
+        enable_prefix_caching=False,
+        disable_log_stats=False,
+        compilation_config=CompilationConfig(),
+    ) as spec_runner:
+        outputs = spec_runner.llm.generate(
+            ["What is the capital of France?"] * 4,
+            SamplingParams(temperature=0.0, max_tokens=32),
+        )
+        assert all(o.outputs[0].text for o in outputs)
+        assert compute_acceptance_len(spec_runner.llm.get_metrics()) > 1.0

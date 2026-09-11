@@ -348,6 +348,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
+        if dummy_run:
+            # Profiling hands over max_num_seqs requests regardless of the token
+            # budget. A real batch never holds more than this many, since each
+            # request costs num_query_per_req draft tokens, and the per-request
+            # index buffers (anchor positions, sample indices) are only valid up
+            # to that bound.
+            num_reqs = min(num_reqs, self.max_num_tokens // self.num_query_per_req)
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
