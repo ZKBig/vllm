@@ -14,6 +14,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.v1.worker.gpu.spec_decode.xpress import kernels
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
+from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer
 from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
 
 logger = init_logger(__name__)
@@ -223,6 +224,8 @@ class Qwen3XPressModel(DFlashQwen3Model):
 
 
 class Qwen3XPressForCausalLM(DFlashQwen3ForCausalLM):
+    model_cls: type[Qwen3XPressModel] = Qwen3XPressModel
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -232,7 +235,7 @@ class Qwen3XPressForCausalLM(DFlashQwen3ForCausalLM):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.model = Qwen3XPressModel(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
@@ -318,3 +321,18 @@ class Qwen3XPressForCausalLM(DFlashQwen3ForCausalLM):
             raw_mix_L.to(self.model.xpress_head.mix_L.dtype)
         )
         self.model._build_fused_kv_buffers()
+
+
+class Qwen3XPressDFlash2Model(Qwen3XPressModel):
+    """XPress refiner on the DFlash2 backbone: the same anchored-block decoder
+    with a grouped dynamic convolution around each attention and MLP sublayer.
+    Only the layer class changes; the refiner head and the Jacobi refinement are
+    untouched. The candidate selector DFlash2 pairs with its own head is not
+    used here -- the refiner seeds from the drafter's argmax as it always does.
+    """
+
+    decoder_layer_cls = DFlash2Qwen3DecoderLayer
+
+
+class Qwen3XPressDFlash2ForCausalLM(Qwen3XPressForCausalLM):
+    model_cls = Qwen3XPressDFlash2Model
