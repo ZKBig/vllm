@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -14,7 +15,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.v1.worker.gpu.spec_decode.xpress import kernels
 
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
-from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer
+from .qwen3_dflash2 import CandidateSelector, DFlash2Qwen3DecoderLayer
 from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
 
 logger = init_logger(__name__)
@@ -86,13 +87,22 @@ class XPressRefinerHead(nn.Module):
         anchor_ids: torch.Tensor,
         tok_am1_ids: torch.Tensor,
         num_passes: int,
+        seed_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Greedy, so a settled prefix stays settled and K passes converge monotonically.
         N, B, _ = base_logits_full.shape
         hcache = self.hidden_cache(h_full)
         blk = torch.empty(N, B, dtype=torch.long, device=h_full.device)
         blk[:, 0] = anchor_ids
-        blk[:, 1:] = base_logits_full[:, 1:, :].argmax(dim=-1)
+        # seed_ids: the selector's greedy walk over the unary top-k, when the
+        # checkpoint carries a candidate selector. It replaces the per-slot argmax
+        # as the Jacobi starting point and is computed ONCE -- the candidate set is
+        # never rescored between passes, so the refine loop stays fixed-shape.
+        blk[:, 1:] = (
+            seed_ids
+            if seed_ids is not None
+            else base_logits_full[:, 1:, :].argmax(dim=-1)
+        )
 
         if not base_logits_full.is_cuda:
             # Reference path for the CPU unit tests, which run the head in float64
@@ -327,12 +337,97 @@ class Qwen3XPressDFlash2Model(Qwen3XPressModel):
     """XPress refiner on the DFlash2 backbone: the same anchored-block decoder
     with a grouped dynamic convolution around each attention and MLP sublayer.
     Only the layer class changes; the refiner head and the Jacobi refinement are
-    untouched. The candidate selector DFlash2 pairs with its own head is not
-    used here -- the refiner seeds from the drafter's argmax as it always does.
+    untouched.
+
+    When the checkpoint was trained with ``xpress_selector``, DFlash2's bilinear
+    candidate selector is loaded alongside the refiner and its greedy walk over
+    the unary top-k replaces the per-slot argmax as the Jacobi seed. The walk runs
+    ONCE per draft step; the candidate set is not rescored between passes, so the
+    selector costs one pass worth of work no matter how large K is and the refine
+    loop keeps the fixed shape the CUDA graph needs.
     """
 
     decoder_layer_cls = DFlash2Qwen3DecoderLayer
 
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        start_layer_id: int = 0,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            vllm_config=vllm_config,
+            start_layer_id=start_layer_id,
+            prefix=prefix,
+        )
+        self.candidate_selector: CandidateSelector | None = None
+        if getattr(self.config, "xpress_selector", False):
+            # Its own tag, or it shares the draft head's compile cache.
+            with set_model_tag("xpress_candidate_selector"):
+                self.candidate_selector = CandidateSelector(
+                    hidden_size=self.config.hidden_size,
+                    vocab_size=self.config.vocab_size,
+                    rank=int(self.config.selector_rank),
+                    top_k=int(self.config.selector_top_k),
+                    params_dtype=vllm_config.model_config.dtype,
+                    prefix=maybe_prefix(prefix, "candidate_selector"),
+                )
+
+    def selector_seed(
+        self,
+        base_logits_full: torch.Tensor,  # [N, B, V]
+        h_full: torch.Tensor,  # [N, B, H]
+        anchor_ids: torch.Tensor,  # [N]
+    ) -> torch.Tensor:
+        """DFlash2's greedy selector walk over the unary top-k, at temperature 0.
+
+        Mirrors the trainer's ``XPressModel._selector_seed`` exactly: per slot,
+        score this slot's top-k against the token the walk chose for the previous
+        slot and keep the best. Slot 0 of the block is the anchor, which is given,
+        so the walk starts at slot 1. B-1 iterations of small fixed-shape ops --
+        unrolled into the draft step's graph, like the Jacobi passes themselves.
+        """
+        selector = self.candidate_selector
+        assert selector is not None
+        logits = base_logits_full[:, 1:, :]  # drop the anchor slot
+        k = selector.top_k
+        candidates = logits.topk(k, dim=-1).indices  # [N, B-1, k]
+        unary = logits.gather(-1, candidates).float()  # [N, B-1, k]
+        proj = selector.hidden_projection(
+            h_full[:, 1:, :].to(selector.hidden_projection.weight.dtype)
+        )  # [N, B-1, r]
+        out = torch.empty_like(candidates[..., 0])
+        prev = anchor_ids
+        for slot in range(out.shape[1]):
+            context = selector.predecessor_codebook[prev] * proj[:, slot]
+            successors = selector.successor_codebook[candidates[:, slot]]
+            trans = (context.unsqueeze(-2) * successors).sum(dim=-1)
+            best = (unary[:, slot] + trans.float()).argmax(dim=-1)
+            prev = candidates[:, slot].gather(1, best.unsqueeze(1)).squeeze(1)
+            out[:, slot] = prev
+        return out
+
 
 class Qwen3XPressDFlash2ForCausalLM(Qwen3XPressForCausalLM):
     model_cls = Qwen3XPressDFlash2Model
+
+    def jacobi_refine_greedy(
+        self,
+        base_logits_full: torch.Tensor,
+        h_full: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        tok_am1_ids: torch.Tensor,
+        num_passes: int,
+    ) -> torch.Tensor:
+        seed_ids = None
+        if self.model.candidate_selector is not None:
+            seed_ids = self.model.selector_seed(base_logits_full, h_full, anchor_ids)
+        return self.model.xpress_head.jacobi_refine_greedy(
+            base_logits_full,
+            h_full,
+            anchor_ids,
+            tok_am1_ids,
+            num_passes,
+            seed_ids=seed_ids,
+        )
