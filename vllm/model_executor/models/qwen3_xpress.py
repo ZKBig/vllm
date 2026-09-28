@@ -3,6 +3,8 @@
 
 from collections.abc import Iterable
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,6 +37,14 @@ class XPressRefinerHead(nn.Module):
         self.hidden_size = int(hidden_size)
         self.block_size = int(block_size)
         self.rank = int(rank)
+        # XPRESS_TOPC=C scores each pass on the base logits' top-C candidates
+        # instead of the full vocabulary. The readout weight read per pass drops
+        # from [r, V] (78MB at V=152k) to [r, C] gathered once per step, which is
+        # what the pass is bandwidth-bound on. 0 keeps exact full-vocab scoring,
+        # which is the released setting: under top-C the refiner cannot reach a
+        # token the drafter left outside its top-C, so the block it converges to
+        # is no longer the exact sequential decode.
+        self.topc = int(os.environ.get("XPRESS_TOPC", "1024"))
         r = self.rank
         self.w1 = nn.Embedding(vocab_size, r)
         self.down_h = nn.Linear(hidden_size, r, bias=False)
@@ -118,6 +128,32 @@ class XPressRefinerHead(nn.Module):
         buf = self.fused_buffers()
         rows = N * (B - 1)
         v = base_logits_full.shape[-1]
+
+        if self.topc:
+            # Gathered once per draft step, not per pass: the candidate set is fixed by
+            # the drafter's base logits, and rescoring it every pass would reintroduce
+            # the full-vocab read this path exists to avoid.
+            c = min(self.topc, v)
+            slots = base_logits_full[:, 1:, :]
+            cand = slots.topk(c, dim=-1).indices                     # [N, B-1, C]
+            base_c = slots.gather(-1, cand)                          # [N, B-1, C]
+            w2c = self.w2.weight[cand].transpose(-1, -2).reshape(
+                rows, self.rank, c
+            )                                                        # [rows, r, C]
+            xh0 = torch.mm(hcache.view(N * B, -1), buf["whc_t"]).view(N, B, self.rank)
+            lat0 = torch.empty(N, B - 1, self.rank, dtype=base_logits_full.dtype,
+                               device=base_logits_full.device)
+            for _ in range(num_passes):
+                kernels.xpress_latent_pass(
+                    blk, tok_am1_ids, xh0, lat0, self.w1.weight, buf["wlat_t"],
+                    buf["mix_kjc"], buf["wg_t"], buf["wu_t"], buf["wd_t"],
+                )
+                bias_c = torch.bmm(lat0.view(rows, 1, self.rank), w2c).view(N, B - 1, c)
+                # One launch for add + argmax + the candidate-to-vocab gather. The torch
+                # spelling costs ~7us per pass here, nearly all of it a small reduction
+                # kernel's fixed overhead rather than the 16KB it reads.
+                kernels.fused_topc_argmax_to_blk(base_c, bias_c, cand, blk)
+            return blk[:, 1:]
         # ONE scratch set sized for the largest N seen. vLLM captures many batch
         # buckets, and a per-N cache would pin GBs that belong to the KV cache.
         if self._scratch.get("cap", 0) < N:

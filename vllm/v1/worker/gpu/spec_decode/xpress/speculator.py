@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -36,7 +37,12 @@ class XPressSpeculator(DFlashSpeculator):
         self.sample_from_anchor = False
         self.num_query_per_req = 1 + self.num_speculative_steps
 
-        self.num_jacobi_passes = int(getattr(hf, "xpress_num_passes", 6))
+        # XPRESS_NUM_PASSES overrides the checkpoint, so one converted draft dir can
+        # be swept over K without reconverting. K is a Python loop count inside the
+        # captured region and is read before capture, so the graph stays valid.
+        self.num_jacobi_passes = int(
+            os.environ.get("XPRESS_NUM_PASSES", getattr(hf, "xpress_num_passes", 6))
+        )
         logger.info("XPress: K=%d Jacobi passes", self.num_jacobi_passes)
         # Query offset 0 of each request is the anchor. Its refined output is
         # discarded; its latent reaches the draft slots through mixer column 0.
