@@ -303,8 +303,12 @@ def _xpress_topc_argmax_to_blk_kernel(
     cand_ptr,
     blk_ptr,
     C,
+    lmax_ptr,
+    lsum_ptr,
+    inv_temp,
     B: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    STATS: tl.constexpr,
 ):
     """argmax over a slot's C candidates, written straight back as a token id.
 
@@ -339,17 +343,44 @@ def _xpress_topc_argmax_to_blk_kernel(
     j = row % (B - 1)
     tl.store(blk_ptr + n * B + j + 1, tok)
 
+    if STATS:
+        # The acceptance estimator wants logit(max q) per slot, which it derives
+        # from a max and a sumexp. This row is already in registers, so producing
+        # them here is one more reduction rather than a second pass over a
+        # [rows, V] tensor the fused epilogue exists to avoid writing. The sum
+        # covers the candidates only, so it understates the partition function by
+        # whatever mass falls outside the top-C; the estimator recalibrates
+        # against observed acceptances, so a systematic offset lands in its
+        # per-position intercept instead of in the prediction.
+        t = tl.where(mask, s * inv_temp, float("-inf"))
+        m = tl.max(t, axis=0)
+        se = tl.sum(tl.exp(t - m), axis=0)
+        tl.store(lmax_ptr + row, m)
+        tl.store(lsum_ptr + row, se)
 
-def fused_topc_argmax_to_blk(base_c, bias_c, cand, blk) -> None:
-    """Run ``_xpress_topc_argmax_to_blk_kernel``; see it for shapes."""
+
+def fused_topc_argmax_to_blk(
+    base_c, bias_c, cand, blk, local_max=None, local_sumexp=None, inv_temp=1.0
+) -> None:
+    """Run ``_xpress_topc_argmax_to_blk_kernel``; see it for shapes.
+
+    Passing ``local_max`` and ``local_sumexp`` ([rows, 1] fp32) also writes the
+    two statistics the acceptance estimator otherwise reduces out of the draft
+    logits, with the row scaled by ``inv_temp`` first.
+    """
     N, Bm1, C = base_c.shape
+    stats = local_max is not None
     _xpress_topc_argmax_to_blk_kernel[(N * Bm1,)](
         base_c,
         bias_c,
         cand,
         blk,
         C,
+        local_max if stats else base_c,
+        local_sumexp if stats else base_c,
+        inv_temp,
         B=Bm1 + 1,
         BLOCK_C=triton.next_power_of_2(C),
+        STATS=stats,
         num_warps=4,
     )
