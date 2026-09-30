@@ -447,60 +447,6 @@ class OnlineAcceptanceEstimator:
         )
         self._refits += 1
 
-    def predict_from_stats(
-        self,
-        local_max: torch.Tensor,
-        local_sumexp: torch.Tensor,
-        idx_mapping: torch.Tensor,
-        draft_step: torch.Tensor,
-        confidence_probs: torch.Tensor,
-        temperature: torch.Tensor,
-    ) -> None:
-        """Predict from a max/sumexp pair the caller already reduced.
-
-        ``predict`` exists for speculators that materialize [num_tokens, vocab]
-        draft logits; the reduction over that tensor is its first step. A
-        speculator whose sampling epilogue already sweeps the row -- XPress fuses
-        the add, the argmax and the candidate gather into one pass and never
-        writes the logits -- can hand the two statistics over instead, which
-        keeps the vocab-wide tensor out of memory and out of the bandwidth
-        budget. Temperature scaling must already be applied, since the raw
-        logits are gone by this point.
-
-        Args:
-            local_max: [num_tokens, num_blocks] per-block maxima, fp32.
-            local_sumexp: [num_tokens, num_blocks] per-block sum of
-                exp(logit - block max), fp32, aligned with ``local_max``.
-            idx_mapping: [num_tokens] request-state index per row, -1 for padding.
-            draft_step: per-row draft step, or a 0-dim tensor for a shared step.
-            confidence_probs: the per-slot buffer the prediction is written to.
-            temperature: [max_num_reqs] sampling temperature per request.
-        """
-        num_tokens, num_blocks = local_max.shape
-        _predict_kernel[(num_tokens,)](
-            self.features,
-            self.features.stride(0),
-            self.predictions,
-            self.predictions.stride(0),
-            confidence_probs,
-            confidence_probs.stride(0),
-            self.slope,
-            self.intercepts,
-            local_max,
-            local_max.stride(0),
-            local_sumexp,
-            local_sumexp.stride(0),
-            idx_mapping,
-            idx_mapping.stride(0),
-            draft_step,
-            num_tokens,
-            num_blocks,
-            per_token_step=draft_step.dim() > 0,
-            NUM_SPECULATIVE_STEPS=self.num_speculative_steps,
-            MAX_LOG_ODDS=_MAX_LOG_ODDS,
-            PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
-        )
-
     def predict(
         self,
         logits: torch.Tensor,

@@ -92,60 +92,7 @@ class XPressSpeculator(DFlashSpeculator):
         # speculator can reach, so the anchor id stands in for it (see __init__).
         tok_am1 = anchor_ids
         head = self.model.model.xpress_head
-        stats = self._acceptance_stats(num_reqs)
         draft = head.jacobi_refine_greedy(
-            base_full, h_full, anchor_ids, tok_am1, self.num_jacobi_passes,
-            stats=stats,
+            base_full, h_full, anchor_ids, tok_am1, self.num_jacobi_passes
         )
         self.draft_tokens[:num_reqs, : self.num_speculative_steps] = draft
-        if stats is not None:
-            self._predict_acceptance(num_reqs, stats)
-
-    def _acceptance_stats(self, num_reqs: int):
-        """Scratch for the estimator's max/sumexp, or None when it is off.
-
-        One row per draft slot, laid out like the refine loop's rows
-        (``n * (B - 1) + j``) so the epilogue can write them by its own row id.
-        """
-        if self.acceptance_estimator is None:
-            return None
-        rows = num_reqs * self.num_speculative_steps
-        if getattr(self, "_stat_cap", 0) < rows:
-            self._stat_cap = rows
-            self._stat_max = torch.empty(rows, 1, dtype=torch.float32,
-                                         device=self.device)
-            self._stat_sum = torch.empty_like(self._stat_max)
-        # The draft is greedy, so the estimator's temperature scaling is a no-op;
-        # a sampling path would pass 1 / T here instead.
-        return (self._stat_max[:rows], self._stat_sum[:rows], 1.0)
-
-    def _predict_acceptance(self, num_reqs: int, stats) -> None:
-        """Grade this block's slots, one estimator row per draft slot.
-
-        The DFlash family samples one token per step and hands the estimator one
-        row per (request, step). XPress produces the whole block at once, so the
-        mapping is built here: row ``n * N + j`` belongs to request ``n`` at draft
-        step ``j``.
-        """
-        assert self.acceptance_estimator is not None
-        N = self.num_speculative_steps
-        rows = num_reqs * N
-        if getattr(self, "_stat_idx_cap", 0) < rows:
-            self._stat_idx_cap = rows
-            self._stat_step = (
-                torch.arange(N, dtype=torch.int32, device=self.device)
-                .repeat(self.max_num_reqs)
-            )
-            self._stat_idx = torch.empty(self.max_num_reqs * N, dtype=torch.int32,
-                                         device=self.device)
-        self._stat_idx[:rows] = (
-            self.idx_mapping[:num_reqs].to(torch.int32).repeat_interleave(N)
-        )
-        self.acceptance_estimator.predict_from_stats(
-            stats[0],
-            stats[1],
-            self._stat_idx[:rows],
-            self._stat_step[:rows],
-            self.draft_token_confidence_probs,
-            self.temperature,
-        )

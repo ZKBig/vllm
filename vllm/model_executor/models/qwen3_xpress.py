@@ -98,7 +98,6 @@ class XPressRefinerHead(nn.Module):
         tok_am1_ids: torch.Tensor,
         num_passes: int,
         seed_ids: torch.Tensor | None = None,
-        stats: tuple[torch.Tensor, torch.Tensor, float] | None = None,
     ) -> torch.Tensor:
         # Greedy, so a settled prefix stays settled and K passes converge monotonically.
         N, B, _ = base_logits_full.shape
@@ -144,7 +143,7 @@ class XPressRefinerHead(nn.Module):
             xh0 = torch.mm(hcache.view(N * B, -1), buf["whc_t"]).view(N, B, self.rank)
             lat0 = torch.empty(N, B - 1, self.rank, dtype=base_logits_full.dtype,
                                device=base_logits_full.device)
-            for _p in range(num_passes):
+            for _ in range(num_passes):
                 kernels.xpress_latent_pass(
                     blk, tok_am1_ids, xh0, lat0, self.w1.weight, buf["wlat_t"],
                     buf["mix_kjc"], buf["wg_t"], buf["wu_t"], buf["wd_t"],
@@ -153,16 +152,7 @@ class XPressRefinerHead(nn.Module):
                 # One launch for add + argmax + the candidate-to-vocab gather. The torch
                 # spelling costs ~7us per pass here, nearly all of it a small reduction
                 # kernel's fixed overhead rather than the 16KB it reads.
-                # The last pass also emits the max/sumexp the acceptance
-                # estimator needs; earlier passes are intermediate and their
-                # statistics would be overwritten anyway.
-                _last = _p == num_passes - 1
-                kernels.fused_topc_argmax_to_blk(
-                    base_c, bias_c, cand, blk,
-                    local_max=stats[0] if (_last and stats is not None) else None,
-                    local_sumexp=stats[1] if (_last and stats is not None) else None,
-                    inv_temp=1.0 if stats is None else stats[2],
-                )
+                kernels.fused_topc_argmax_to_blk(base_c, bias_c, cand, blk)
             return blk[:, 1:]
         # ONE scratch set sized for the largest N seen. vLLM captures many batch
         # buckets, and a per-N cache would pin GBs that belong to the KV cache.
